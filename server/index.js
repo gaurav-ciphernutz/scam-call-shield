@@ -4,12 +4,20 @@
  * for the browser's direct Live API WebSocket.
  */
 import 'dotenv/config';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { SYSTEM_INSTRUCTION, ASSESS_INSTRUCTION, ASSESS_SCHEMA } from './prompt.js';
 
-const PORT = process.env.PORT || 3001;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DIST_DIR = path.resolve(__dirname, '..', 'dist');
+
+const PORT = Number(process.env.PORT) || 3001;
+const HOST = '0.0.0.0';
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = process.env.GEMINI_LIVE_MODEL; // no silent default: must be verified (see npm run list-models)
 const MODALITY = process.env.GEMINI_RESPONSE_MODALITY === 'TEXT' ? Modality.TEXT : Modality.AUDIO;
@@ -25,26 +33,32 @@ const ai2 = new GoogleGenAI({ apiKey: API_KEY }); // default API version for gen
 const app = express();
 app.use(express.json({ limit: '4mb' }));
 
-const isAllowedOrigin = (origin) => {
+const isAllowedOrigin = (origin, req) => {
   if (!origin) return true;
   if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
   if (process.env.FRONTEND_URL && origin === process.env.FRONTEND_URL) return true;
+  if (process.env.RENDER_EXTERNAL_URL && origin === process.env.RENDER_EXTERNAL_URL) return true;
+  const host = req?.get?.('host');
+  if (host && (origin === `https://${host}` || origin === `http://${host}`)) return true;
   return false;
 };
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (isAllowedOrigin(origin)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`Origin ${origin} not allowed by CORS`));
-    }
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true,
-}));
-app.options('*', cors());
+const corsOptionsDelegate = (req, cb) => {
+  const origin = req.header('Origin');
+  if (isAllowedOrigin(origin, req)) {
+    cb(null, {
+      origin: true,
+      methods: ['GET', 'POST', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization'],
+      credentials: true,
+    });
+  } else {
+    cb(new Error(`Origin ${origin} not allowed by CORS`));
+  }
+};
+
+app.use(cors(corsOptionsDelegate));
+app.options('*', cors(corsOptionsDelegate));
 
 // Naive per-IP rate limit (demo-grade)
 const hits = new Map();
@@ -120,5 +134,15 @@ app.post('/api/assess', rateLimit, async (req, res) => {
   }
 });
 
-app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
-app.listen(PORT, () => console.log(`[Server] http://localhost:${PORT} (model ${MODEL})`));
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Not found' }));
+
+if (fs.existsSync(DIST_DIR)) {
+  app.use(express.static(DIST_DIR));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(DIST_DIR, 'index.html'));
+  });
+} else {
+  app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+}
+
+app.listen(PORT, HOST, () => console.log(`[Server] http://${HOST}:${PORT} (model ${MODEL})`));
