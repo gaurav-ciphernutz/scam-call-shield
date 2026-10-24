@@ -1,40 +1,45 @@
+import { memo, useMemo } from 'react';
 import { calculateThreatScore, THREAT_THRESHOLDS } from '../utils/threatScore';
-import type { ScamAssessment } from '../types';
+import type { ScamAssessment, ThreatCategory } from '../types';
 
 interface ThreatMeterProps {
   assessment: ScamAssessment | null;
 }
 
-export function ThreatMeter({ assessment }: ThreatMeterProps) {
-  const threat = calculateThreatScore(assessment);
-  const { score, category, label, breakdown } = threat;
+const CATEGORY_STYLES: Record<
+  ThreatCategory,
+  { barColor: string; badgeColor: string; textColor: string; glow: string }
+> = {
+  safe: {
+    barColor: 'bg-emerald-500',
+    badgeColor: 'bg-emerald-100 text-emerald-800 border-emerald-300',
+    textColor: 'text-emerald-700',
+    glow: 'shadow-emerald-500/20',
+  },
+  suspicious: {
+    barColor: 'bg-amber-500',
+    badgeColor: 'bg-amber-100 text-amber-800 border-amber-300',
+    textColor: 'text-amber-700',
+    glow: 'shadow-amber-500/20',
+  },
+  high: {
+    barColor: 'bg-rose-600',
+    badgeColor: 'bg-rose-100 text-rose-800 border-rose-300 animate-pulse',
+    textColor: 'text-rose-700 font-extrabold',
+    glow: 'shadow-rose-600/30',
+  },
+  evaluating: {
+    barColor: 'bg-slate-300',
+    badgeColor: 'bg-slate-100 text-slate-700 border-slate-300',
+    textColor: 'text-slate-500',
+    glow: '',
+  },
+};
 
-  const categoryStyles = {
-    safe: {
-      barColor: 'bg-emerald-500',
-      badgeColor: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-      textColor: 'text-emerald-700',
-      glow: 'shadow-emerald-500/20',
-    },
-    suspicious: {
-      barColor: 'bg-amber-500',
-      badgeColor: 'bg-amber-100 text-amber-800 border-amber-300',
-      textColor: 'text-amber-700',
-      glow: 'shadow-amber-500/20',
-    },
-    high: {
-      barColor: 'bg-rose-600',
-      badgeColor: 'bg-rose-100 text-rose-800 border-rose-300 animate-pulse',
-      textColor: 'text-rose-700 font-extrabold',
-      glow: 'shadow-rose-600/30',
-    },
-    evaluating: {
-      barColor: 'bg-slate-300',
-      badgeColor: 'bg-slate-100 text-slate-700 border-slate-300',
-      textColor: 'text-slate-500',
-      glow: '',
-    },
-  }[category];
+export const ThreatMeter = memo(function ThreatMeter({ assessment }: ThreatMeterProps) {
+  const threat = useMemo(() => calculateThreatScore(assessment), [assessment]);
+  const { score, category, label, breakdown } = threat;
+  const categoryStyles = CATEGORY_STYLES[category];
 
   return (
     <div
@@ -118,4 +123,4 @@ export function ThreatMeter({ assessment }: ThreatMeterProps) {
       </p>
     </div>
   );
-}
+});
