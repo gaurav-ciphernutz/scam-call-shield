@@ -11,7 +11,7 @@
  * - Transcript accumulation and exact phrase evidence synchronization
  */
 
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import type {
   DemoCall,
   ScamAssessment,
@@ -52,6 +52,7 @@ export interface ScamShieldActions {
 const MIN_ASSESS_INTERVAL_SEC = 1.6;
 const INITIAL_ASSESS_OFFSET_SEC = 1.8;
 const REQUEST_TIMEOUT_MS = 9000;
+const FINAL_MAX_RETRIES = 2;
 
 const INITIAL_STATE: ScamShieldState = {
   selectedCall: null,
@@ -75,63 +76,246 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
   const selectedCallRef = useRef<DemoCall | null>(null);
   const runIdRef = useRef<number>(0);
   const appliedUptoRef = useRef<number>(0);
+  const currentTimeRef = useRef<number>(0);
   const haveAssessTranscriptRef = useRef<boolean>(false);
 
-  // In-flight guard and rate coordination refs
+  // In-flight guard, final wrap-up queue, and rate coordination refs
   const isAssessingRef = useRef<boolean>(false);
+  const pendingFinalPosRef = useRef<number | null>(null);
   const activeAbortRef = useRef<AbortController | null>(null);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastDispatchedAtRef = useRef<number>(0);
   const nextAllowedAssessTimeRef = useRef<number>(0);
   const consecutiveErrorsRef = useRef<number>(0);
   const timelineRef = useRef<DetectionTimeline>(createInitialTimeline());
 
-  // Initialize services
+  const clearPendingTimers = useCallback(() => {
+    if (retryTimerRef.current !== null) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    pendingFinalPosRef.current = null;
+    activeAbortRef.current?.abort();
+    activeAbortRef.current = null;
+    isAssessingRef.current = false;
+  }, []);
+
+  // Initialize services once and clean up on unmount
   useEffect(() => {
     geminiRef.current = new GeminiLiveService();
     streamingRef.current = new AudioStreamingService();
 
     return () => {
-      activeAbortRef.current?.abort();
-      geminiRef.current?.disconnect();
+      runIdRef.current++;
+      clearPendingTimers();
+      void geminiRef.current?.disconnect();
       streamingRef.current?.destroy();
     };
-  }, []);
+  }, [clearPendingTimers]);
 
   const setError = useCallback((error: string) => {
     setState(prev => ({ ...prev, error, connectionState: 'error', assessmentStatus: 'error' }));
   }, []);
 
-  const selectCall = useCallback((call: DemoCall) => {
-    // Abort active in-flight assessment
-    activeAbortRef.current?.abort();
-    activeAbortRef.current = null;
-    isAssessingRef.current = false;
+  /**
+   * Apply a validated assessment update deterministically, recording timeline milestones
+   * without allowing stale or lower-risk results to overwrite high-risk warnings.
+   */
+  const applyAssessmentUpdate = useCallback(
+    (
+      incoming: ScamAssessment,
+      audioPosSec: number,
+      sourceLabel: string,
+      preserveTranscript?: string,
+    ): ScamAssessment => {
+      if (timelineRef.current.firstAssessmentTimeMs === null && incoming.riskLevel !== 'unknown') {
+        timelineRef.current = recordTimelineEvent(
+          timelineRef.current,
+          'first_assessment',
+          audioPosSec,
+          'First Assessment Received',
+          `Initial signal (${sourceLabel}): ${incoming.riskLevel.toUpperCase()}`,
+          incoming.riskLevel,
+        );
+      }
 
-    if (geminiRef.current?.connected) {
-      geminiRef.current.disconnect();
-    }
-    streamingRef.current?.stop();
+      const prevRisk = assessmentRef.current?.riskLevel ?? 'unknown';
+      const merged = mergeAssessments(assessmentRef.current, {
+        ...incoming,
+        transcript: preserveTranscript,
+      });
+      assessmentRef.current = merged;
 
-    runIdRef.current++;
-    selectedCallRef.current = call;
-    assessmentRef.current = null;
-    appliedUptoRef.current = 0;
-    lastDispatchedAtRef.current = 0;
-    nextAllowedAssessTimeRef.current = 0;
-    consecutiveErrorsRef.current = 0;
-    timelineRef.current = createInitialTimeline();
+      if (
+        merged.riskLevel === 'high' &&
+        timelineRef.current.warningVisibleTimeMs === null
+      ) {
+        const categories = merged.redFlags.map(f => f.category).join(', ');
+        timelineRef.current = recordTimelineEvent(
+          timelineRef.current,
+          'warning_visible',
+          audioPosSec,
+          'High-Risk Warning Visible',
+          categories
+            ? `Identified fraud vectors: ${categories}`
+            : `Triggered by ${sourceLabel}: ${merged.warning || 'Scam detected'}`,
+          'high',
+        );
+      } else if (
+        merged.riskLevel === 'medium' &&
+        prevRisk !== 'medium' &&
+        prevRisk !== 'high'
+      ) {
+        timelineRef.current = recordTimelineEvent(
+          timelineRef.current,
+          'risk_escalation',
+          audioPosSec,
+          'Suspicious Activity Escalation',
+          `Elevated to MEDIUM risk (${sourceLabel})`,
+          'medium',
+        );
+      }
 
-    setState({
-      ...INITIAL_STATE,
-      selectedCall: call,
-      timeline: createInitialTimeline(),
-    });
+      return merged;
+    },
+    [],
+  );
 
-    // Pre-load audio for instant playback start
-    streamingRef.current?.load(call.audioFile).catch(err => {
-      console.warn('[useScamShield] Pre-load failed:', err);
-    });
-  }, []);
+  /**
+   * Execute the final end-of-call assessment with bounded retry on transient errors.
+   */
+  const executeFinalAssessment = useCallback(
+    (runId: number, finalPos: number, attempt = 0) => {
+      const streaming = streamingRef.current;
+      if (
+        runId !== runIdRef.current ||
+        !streaming ||
+        assessmentRef.current?.assessmentComplete
+      ) {
+        return;
+      }
+
+      const fullPcm = streaming.pcmBase64UpTo(finalPos);
+      if (!fullPcm) return;
+
+      isAssessingRef.current = true;
+      const finalAbort = new AbortController();
+      activeAbortRef.current = finalAbort;
+
+      setState(prev => ({
+        ...prev,
+        assessmentStatus: attempt > 0 ? 'retrying' : 'analyzing',
+      }));
+
+      requestAssessment(fullPcm, true, finalAbort.signal, REQUEST_TIMEOUT_MS)
+        .then(finalResult => {
+          if (runId !== runIdRef.current) return;
+
+          if (finalResult.transcript) {
+            haveAssessTranscriptRef.current = true;
+          }
+
+          const merged = applyAssessmentUpdate(
+            { ...finalResult, assessmentComplete: true },
+            finalPos,
+            'Final assessment',
+            finalResult.transcript,
+          );
+
+          timelineRef.current = recordTimelineEvent(
+            timelineRef.current,
+            'assessment_complete',
+            finalPos,
+            'Final Assessment Complete',
+            `Final verdict: ${merged.riskLevel.toUpperCase()}`,
+            merged.riskLevel,
+          );
+
+          setState(prev => ({
+            ...prev,
+            assessment: merged,
+            transcript: merged.transcript ?? finalResult.transcript ?? prev.transcript,
+            timeline: timelineRef.current,
+            assessmentStatus: 'complete',
+            error: null,
+          }));
+        })
+        .catch((err: unknown) => {
+          if (runId !== runIdRef.current) return;
+          const isAborted =
+            finalAbort.signal.aborted ||
+            (err instanceof Error && err.name === 'AbortError');
+          if (isAborted && !(err instanceof AssessmentError && err.isTimeout)) {
+            return;
+          }
+
+          if (attempt < FINAL_MAX_RETRIES) {
+            const delayMs = 1200 * (attempt + 1);
+            setState(prev => ({ ...prev, assessmentStatus: 'retrying' }));
+            retryTimerRef.current = setTimeout(() => {
+              retryTimerRef.current = null;
+              executeFinalAssessment(runId, finalPos, attempt + 1);
+            }, delayMs);
+          } else {
+            // Preserve any existing incremental assessment and mark complete gracefully
+            if (assessmentRef.current) {
+              const completed = { ...assessmentRef.current, assessmentComplete: true };
+              assessmentRef.current = completed;
+              setState(prev => ({
+                ...prev,
+                assessment: completed,
+                assessmentStatus: 'complete',
+              }));
+            } else {
+              setState(prev => ({ ...prev, assessmentStatus: 'idle' }));
+            }
+          }
+        })
+        .finally(() => {
+          if (runId === runIdRef.current && activeAbortRef.current === finalAbort) {
+            isAssessingRef.current = false;
+            activeAbortRef.current = null;
+          }
+        });
+    },
+    [applyAssessmentUpdate],
+  );
+
+  const selectCall = useCallback(
+    (call: DemoCall) => {
+      runIdRef.current++;
+      clearPendingTimers();
+
+      if (geminiRef.current?.connected) {
+        void geminiRef.current.disconnect();
+      }
+      streamingRef.current?.stop();
+
+      selectedCallRef.current = call;
+      assessmentRef.current = null;
+      appliedUptoRef.current = 0;
+      currentTimeRef.current = 0;
+      lastDispatchedAtRef.current = 0;
+      nextAllowedAssessTimeRef.current = 0;
+      consecutiveErrorsRef.current = 0;
+      haveAssessTranscriptRef.current = false;
+
+      const freshTimeline = createInitialTimeline();
+      timelineRef.current = freshTimeline;
+
+      setState({
+        ...INITIAL_STATE,
+        selectedCall: call,
+        timeline: freshTimeline,
+      });
+
+      // Pre-load audio for instant playback start
+      streamingRef.current?.load(call.audioFile).catch(err => {
+        console.warn('[useScamShield] Pre-load failed:', err);
+      });
+    },
+    [clearPendingTimers],
+  );
 
   const play = useCallback(async () => {
     const call = selectedCallRef.current;
@@ -140,10 +324,11 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
       return;
     }
 
-    const gemini = geminiRef.current!;
-    const streaming = streamingRef.current!;
+    const gemini = geminiRef.current;
+    const streaming = streamingRef.current;
+    if (!gemini || !streaming) return;
 
-    // If paused, resume
+    // If paused, resume without resetting session
     if (streaming.currentState === 'paused' && gemini.connected) {
       streaming.resume();
       setState(prev => ({ ...prev, streamingState: 'streaming', error: null }));
@@ -151,19 +336,19 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
     }
 
     // Fresh start: abort any existing requests and reset state
-    activeAbortRef.current?.abort();
-    activeAbortRef.current = null;
-    isAssessingRef.current = false;
-
     const runId = ++runIdRef.current;
+    clearPendingTimers();
+
     appliedUptoRef.current = 0;
+    currentTimeRef.current = 0;
     lastDispatchedAtRef.current = 0;
     nextAllowedAssessTimeRef.current = 0;
     consecutiveErrorsRef.current = 0;
     haveAssessTranscriptRef.current = false;
     assessmentRef.current = null;
 
-    timelineRef.current = createInitialTimeline();
+    const freshTimeline = createInitialTimeline();
+    timelineRef.current = freshTimeline;
 
     setState(prev => ({
       ...prev,
@@ -172,13 +357,14 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
       assessment: null,
       error: null,
       streamingState: 'loading',
-      timeline: timelineRef.current,
+      timeline: freshTimeline,
       assessmentStatus: 'idle',
     }));
 
     try {
-      // 1. Load audio buffer
+      // 1. Load audio buffer (uses memoized cache if already preloaded)
       await streaming.load(call.audioFile);
+      if (runId !== runIdRef.current) return;
 
       // 2. Connect to Gemini Live
       await gemini.connect({
@@ -192,33 +378,27 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
         },
         onTranscript: (text) => {
           if (runId !== runIdRef.current || haveAssessTranscriptRef.current) return;
+          const clean = text.trim();
+          if (!clean) return;
           setState(prev => ({
             ...prev,
-            transcript: prev.transcript ? prev.transcript + ' ' + text : text,
+            transcript: prev.transcript ? `${prev.transcript} ${clean}` : clean,
           }));
         },
         onAssessment: (live) => {
           if (runId !== runIdRef.current) return;
-          const update = { ...live, transcript: undefined };
-          const merged = mergeAssessments(assessmentRef.current, update);
-          assessmentRef.current = merged;
-
-          // Record high-risk warning timeline event if escalating
-          if (merged.riskLevel === 'high' && timelineRef.current.warningVisibleTimeMs === null) {
-            timelineRef.current = recordTimelineEvent(
-              timelineRef.current,
-              'warning_visible',
-              state.currentTime,
-              'High-Risk Warning Visible',
-              `Triggered by Live engine: ${merged.warning || 'Scam detected'}`,
-              'high',
-            );
-          }
+          // Guard against a late low/unknown Live assessment regressing a completed assessment
+          const merged = applyAssessmentUpdate(
+            live,
+            currentTimeRef.current,
+            'Live engine',
+            undefined,
+          );
 
           setState(prev => ({
             ...prev,
             assessment: merged,
-            timeline: { ...timelineRef.current },
+            timeline: timelineRef.current,
           }));
         },
         onError: (err) => {
@@ -227,6 +407,8 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
           streaming.stop();
         },
       });
+
+      if (runId !== runIdRef.current) return;
 
       // 3. Start audio playback and synchronized streaming
       streaming.start(gemini, {
@@ -244,7 +426,9 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
           }
 
           if (newState === 'ended') {
-            const finalPos = streamingRef.current?.duration || state.currentTime;
+            const finalPos = streaming.duration || currentTimeRef.current;
+            currentTimeRef.current = finalPos;
+
             timelineRef.current = recordTimelineEvent(
               timelineRef.current,
               'playback_end',
@@ -253,81 +437,40 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
               `Audio stream reached end (${finalPos.toFixed(1)}s)`,
             );
 
-            const triggerFinal = () => {
-              if (runId !== runIdRef.current || assessmentRef.current?.assessmentComplete) return;
-              const fullPcm = streaming.pcmBase64UpTo(finalPos);
-              if (!fullPcm) return;
-
-              isAssessingRef.current = true;
-              const finalAbort = new AbortController();
-              activeAbortRef.current = finalAbort;
-
-              requestAssessment(fullPcm, true, finalAbort.signal)
-                .then(finalResult => {
-                  if (runId !== runIdRef.current) return;
-                  timelineRef.current = recordTimelineEvent(
-                    timelineRef.current,
-                    'assessment_complete',
-                    finalPos,
-                    'Final Assessment Complete',
-                    `Final verdict: ${finalResult.riskLevel.toUpperCase()}`,
-                    finalResult.riskLevel,
-                  );
-                  const merged = mergeAssessments(assessmentRef.current, finalResult);
-                  assessmentRef.current = merged;
-                  setState(prev => ({
-                    ...prev,
-                    assessment: merged,
-                    transcript: finalResult.transcript ?? prev.transcript,
-                    timeline: { ...timelineRef.current },
-                    assessmentStatus: 'complete',
-                  }));
-                })
-                .catch(err => {
-                  if (runId === runIdRef.current && err.name !== 'AbortError') {
-                    console.warn('[useScamShield] Final assessment error:', err);
-                  }
-                })
-                .finally(() => {
-                  if (runId === runIdRef.current) {
-                    isAssessingRef.current = false;
-                    activeAbortRef.current = null;
-                  }
-                });
-            };
-
-            // If an assessment is currently in flight, do NOT abort it.
-            // Let it deliver its result, then trigger final wrap-up once it completes.
+            // If an incremental assessment is currently in flight, let it finish and
+            // trigger final assessment deterministically in its .finally() block (no polling interval).
             if (isAssessingRef.current) {
-              const checkPending = setInterval(() => {
-                if (runId !== runIdRef.current) {
-                  clearInterval(checkPending);
-                  return;
-                }
-                if (!isAssessingRef.current) {
-                  clearInterval(checkPending);
-                  triggerFinal();
-                }
-              }, 200);
+              pendingFinalPosRef.current = finalPos;
             } else {
-              triggerFinal();
+              executeFinalAssessment(runId, finalPos);
             }
           }
 
           setState(prev => ({
             ...prev,
             streamingState: newState,
-            timeline: { ...timelineRef.current },
+            timeline: timelineRef.current,
           }));
         },
 
         onProgress: (currentTime, duration) => {
           if (runId !== runIdRef.current) return;
-          setState(prev => ({ ...prev, currentTime, duration }));
+          currentTimeRef.current = currentTime;
+
+          setState(prev =>
+            prev.currentTime === currentTime && prev.duration === duration
+              ? prev
+              : { ...prev, currentTime, duration },
+          );
 
           // ─── Coordinated Incremental Assessment Dispatch ────────────────────────
-          // 1. Skip if before initial offset (speaker greeting)
-          if (currentTime < INITIAL_ASSESS_OFFSET_SEC) return;
+          // 1. Skip if before initial offset (speaker greeting) or already completed
+          if (
+            currentTime < INITIAL_ASSESS_OFFSET_SEC ||
+            assessmentRef.current?.assessmentComplete
+          ) {
+            return;
+          }
 
           // 2. Strict In-Flight Guard: never send overlapping requests
           if (isAssessingRef.current) return;
@@ -338,6 +481,10 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
           // 4. Check assessment cadence pacing
           if (currentTime - lastDispatchedAtRef.current < MIN_ASSESS_INTERVAL_SEC) return;
 
+          // 5. Skip dispatching an incremental request right at the very end of the clip
+          // (within 0.35s of completion) so the final wrap-up request can run immediately on end
+          if (duration > 0 && duration - currentTime < 0.35) return;
+
           const pcm = streaming.pcmBase64UpTo(currentTime);
           if (!pcm) return;
 
@@ -345,70 +492,43 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
           isAssessingRef.current = true;
           lastDispatchedAtRef.current = currentTime;
 
-          setState(prev => ({ ...prev, assessmentStatus: 'analyzing' }));
+          setState(prev =>
+            prev.assessmentStatus === 'analyzing'
+              ? prev
+              : { ...prev, assessmentStatus: 'analyzing' },
+          );
 
           const abortController = new AbortController();
           activeAbortRef.current = abortController;
 
-          // Bounded timeout to prevent pipeline stalls
-          const timeoutId = setTimeout(() => {
-            abortController.abort();
-          }, REQUEST_TIMEOUT_MS);
-
-          requestAssessment(pcm, false, abortController.signal)
+          requestAssessment(pcm, false, abortController.signal, REQUEST_TIMEOUT_MS)
             .then(result => {
-              clearTimeout(timeoutId);
               if (runId !== runIdRef.current || currentTime < appliedUptoRef.current) return;
 
               appliedUptoRef.current = currentTime;
               consecutiveErrorsRef.current = 0;
 
-              // Timeline event: first valid assessment
-              if (timelineRef.current.firstAssessmentTimeMs === null) {
-                timelineRef.current = recordTimelineEvent(
-                  timelineRef.current,
-                  'first_assessment',
-                  currentTime,
-                  'First Assessment Received',
-                  `Initial signal: ${result.riskLevel.toUpperCase()}`,
-                  result.riskLevel,
-                );
+              if (result.transcript) {
+                haveAssessTranscriptRef.current = true;
               }
 
-              // Timeline event: warning visible
-              if (
-                result.riskLevel === 'high' &&
-                timelineRef.current.warningVisibleTimeMs === null
-              ) {
-                timelineRef.current = recordTimelineEvent(
-                  timelineRef.current,
-                  'warning_visible',
-                  currentTime,
-                  'High-Risk Warning Visible',
-                  `Identified fraud vectors: ${result.redFlags.map(f => f.category).join(', ')}`,
-                  'high',
-                );
-              }
-
-              if (result.transcript) haveAssessTranscriptRef.current = true;
-
-              const merged = mergeAssessments(assessmentRef.current, {
-                ...result,
-                transcript: undefined,
-              });
-              assessmentRef.current = merged;
+              const merged = applyAssessmentUpdate(
+                result,
+                currentTime,
+                'Incremental engine',
+                result.transcript,
+              );
 
               setState(prev => ({
                 ...prev,
                 assessment: merged,
-                transcript: result.transcript ?? prev.transcript,
-                timeline: { ...timelineRef.current },
+                transcript: merged.transcript ?? result.transcript ?? prev.transcript,
+                timeline: timelineRef.current,
                 assessmentStatus: 'idle',
                 error: null,
               }));
             })
             .catch((err: Error) => {
-              clearTimeout(timeoutId);
               if (runId !== runIdRef.current) return;
 
               if (err.name === 'AbortError' || (err instanceof AssessmentError && err.isTimeout)) {
@@ -418,15 +538,18 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
               }
 
               if (err instanceof AssessmentError && err.isRateLimit) {
-                // Bounded backoff on 429
-                nextAllowedAssessTimeRef.current = currentTime + 3.0;
+                // Bounded exponential backoff on 429
+                consecutiveErrorsRef.current++;
+                const backoffSec = Math.min(6.0, 2.5 * Math.pow(1.4, consecutiveErrorsRef.current - 1));
+                nextAllowedAssessTimeRef.current = currentTimeRef.current + backoffSec;
                 setState(prev => ({ ...prev, assessmentStatus: 'throttled' }));
                 return;
               }
 
               // Service error (502/503/network)
               consecutiveErrorsRef.current++;
-              nextAllowedAssessTimeRef.current = currentTime + 2.0;
+              const retryDelaySec = Math.min(4.5, 1.8 * consecutiveErrorsRef.current);
+              nextAllowedAssessTimeRef.current = currentTimeRef.current + retryDelaySec;
 
               if (consecutiveErrorsRef.current >= 3) {
                 setState(prev => ({
@@ -441,7 +564,17 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
             .finally(() => {
               if (runId === runIdRef.current) {
                 isAssessingRef.current = false;
-                activeAbortRef.current = null;
+                if (activeAbortRef.current === abortController) {
+                  activeAbortRef.current = null;
+                }
+
+                // If playback ended while this incremental assessment was in flight,
+                // immediately dispatch the queued final assessment now.
+                const pendingFinalPos = pendingFinalPosRef.current;
+                if (pendingFinalPos !== null) {
+                  pendingFinalPosRef.current = null;
+                  executeFinalAssessment(runId, pendingFinalPos);
+                }
               }
             });
         },
@@ -451,12 +584,12 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
           setError(`Audio error: ${err.message}`);
         },
       });
-
     } catch (err) {
+      if (runId !== runIdRef.current) return;
       const message = err instanceof Error ? err.message : String(err);
       setError(`Failed to start analysis: ${message}`);
     }
-  }, [setError, state.currentTime]);
+  }, [applyAssessmentUpdate, clearPendingTimers, executeFinalAssessment, setError]);
 
   const pause = useCallback(() => {
     streamingRef.current?.pause();
@@ -464,14 +597,14 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
 
   const stop = useCallback(() => {
     runIdRef.current++;
-    activeAbortRef.current?.abort();
-    activeAbortRef.current = null;
-    isAssessingRef.current = false;
+    clearPendingTimers();
 
-    geminiRef.current?.disconnect();
+    void geminiRef.current?.disconnect();
     streamingRef.current?.stop();
 
-    timelineRef.current = createInitialTimeline();
+    currentTimeRef.current = 0;
+    const freshTimeline = createInitialTimeline();
+    timelineRef.current = freshTimeline;
 
     setState(prev => ({
       ...prev,
@@ -479,40 +612,29 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
       connectionState: 'disconnected',
       currentTime: 0,
       assessmentStatus: 'idle',
-      timeline: createInitialTimeline(),
+      timeline: freshTimeline,
     }));
-  }, []);
+  }, [clearPendingTimers]);
 
   const restart = useCallback(async () => {
     const call = selectedCallRef.current;
     if (!call) return;
 
-    activeAbortRef.current?.abort();
-    activeAbortRef.current = null;
-    isAssessingRef.current = false;
+    runIdRef.current++;
+    clearPendingTimers();
 
     await geminiRef.current?.disconnect();
     streamingRef.current?.stop();
 
-    geminiRef.current = new GeminiLiveService();
-    streamingRef.current = new AudioStreamingService();
+    await play();
+  }, [clearPendingTimers, play]);
 
-    assessmentRef.current = null;
-    timelineRef.current = createInitialTimeline();
+  const actions = useMemo<ScamShieldActions>(
+    () => ({ selectCall, play, pause, stop, restart }),
+    [selectCall, play, pause, stop, restart],
+  );
 
-    setState({
-      ...INITIAL_STATE,
-      selectedCall: call,
-      timeline: createInitialTimeline(),
-    });
-
-    setTimeout(() => play(), 100);
-  }, [play]);
-
-  return [
-    state,
-    { selectCall, play, pause, stop, restart },
-  ];
+  return [state, actions];
 }
 
 export { DEMO_CALLS };

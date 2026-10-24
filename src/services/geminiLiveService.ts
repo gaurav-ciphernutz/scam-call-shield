@@ -16,33 +16,63 @@ export interface GeminiLiveCallbacks {
   onDisconnected: () => void;
 }
 
+const TOKEN_REQUEST_TIMEOUT_MS = 8000;
+
 export class GeminiLiveService {
   private session: Session | null = null;
   private callbacks: GeminiLiveCallbacks | null = null;
   private isConnected = false;
   private generation = 0; // guards against stale callbacks from old sessions
+  private tokenAbortController: AbortController | null = null;
   private modelText = '';
   private awaitingAssessment = false;
   chunksSent = 0;
 
   async connect(callbacks: GeminiLiveCallbacks): Promise<void> {
+    // Clean up any existing session or in-flight token fetch first
+    await this.disconnect();
+
     const gen = ++this.generation;
     this.callbacks = callbacks;
     this.chunksSent = 0;
 
+    const tokenAbort = new AbortController();
+    this.tokenAbortController = tokenAbort;
+    const timeoutId = setTimeout(() => tokenAbort.abort(), TOKEN_REQUEST_TIMEOUT_MS);
+
     let token: string;
     let model: string;
     try {
-      const res = await fetch(`${BACKEND_URL}/api/token`, { method: 'POST' });
+      const res = await fetch(`${BACKEND_URL}/api/token`, {
+        method: 'POST',
+        signal: tokenAbort.signal,
+      });
       if (!res.ok) throw new Error(`Token request failed (${res.status})`);
-      ({ token, model } = (await res.json()) as { token: string; model: string });
+      const data = (await res.json()) as { token?: unknown; model?: unknown };
+      if (typeof data.token !== 'string' || typeof data.model !== 'string' || !data.token || !data.model) {
+        throw new Error('Invalid session token response from server');
+      }
+      token = data.token;
+      model = data.model;
     } catch (e) {
-      throw new Error(`Could not reach the backend for a session token: ${(e as Error).message}`);
+      if (gen !== this.generation) return;
+      const reason =
+        tokenAbort.signal.aborted
+          ? 'Session token request timed out'
+          : (e as Error).message;
+      throw new Error(`Could not reach the backend for a session token: ${reason}`);
+    } finally {
+      clearTimeout(timeoutId);
+      if (this.tokenAbortController === tokenAbort) {
+        this.tokenAbortController = null;
+      }
     }
+
+    if (gen !== this.generation) return;
 
     // Ephemeral tokens require v1alpha on the client as well.
     const ai = new GoogleGenAI({ apiKey: token, httpOptions: { apiVersion: 'v1alpha' } });
-    this.session = await ai.live.connect({
+    const session = await ai.live.connect({
       model,
       callbacks: {
         onopen: () => {
@@ -67,6 +97,14 @@ export class GeminiLiveService {
         },
       },
     });
+
+    // If disconnected while ai.live.connect was awaiting, close immediately
+    if (gen !== this.generation) {
+      try { session.close(); } catch { /* ignore */ }
+      return;
+    }
+
+    this.session = session;
   }
 
   private handleMessage(m: LiveServerMessage): void {
@@ -120,6 +158,8 @@ export class GeminiLiveService {
 
   async disconnect(): Promise<void> {
     this.generation++; // invalidate callbacks
+    this.tokenAbortController?.abort();
+    this.tokenAbortController = null;
     try { this.session?.close(); } catch { /* ignore */ }
     this.session = null;
     this.isConnected = false;

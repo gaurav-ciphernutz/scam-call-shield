@@ -1,3 +1,4 @@
+import { memo, useMemo } from 'react';
 import type { RedFlag } from '../types';
 import { highlightTranscript } from '../utils/transcriptHighlight';
 
@@ -6,6 +7,8 @@ interface TranscriptPanelProps {
   redFlags?: RedFlag[];
   isLive: boolean;
 }
+
+const EMPTY_FLAGS: RedFlag[] = [];
 
 const CATEGORY_COLORS: Record<string, string> = {
   urgency: 'bg-amber-100 text-amber-900 border-amber-300',
@@ -16,9 +19,19 @@ const CATEGORY_COLORS: Record<string, string> = {
   credential_request: 'bg-purple-100 text-purple-900 border-purple-400 font-semibold',
 };
 
-export function TranscriptPanel({ transcript, redFlags = [], isLive }: TranscriptPanelProps) {
-  const segments = highlightTranscript(transcript, redFlags);
-  const hasHighlights = segments.some(s => s.isHighlighted);
+export const TranscriptPanel = memo(function TranscriptPanel({
+  transcript,
+  redFlags = EMPTY_FLAGS,
+  isLive,
+}: TranscriptPanelProps) {
+  const segments = useMemo(
+    () => highlightTranscript(transcript, redFlags),
+    [transcript, redFlags],
+  );
+  const hasHighlights = useMemo(
+    () => segments.some(s => s.isHighlighted),
+    [segments],
+  );
 
   return (
     <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-sm flex flex-col h-full">
@@ -86,4 +99,4 @@ export function TranscriptPanel({ transcript, redFlags = [], isLive }: Transcrip
       </div>
     </div>
   );
-}
+});

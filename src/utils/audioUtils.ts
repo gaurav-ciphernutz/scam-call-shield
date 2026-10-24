@@ -9,9 +9,13 @@
  * 5. Base64-encode for transmission
  */
 
+import { AUDIO_CONFIG } from './constants';
+
 export interface DecodedAudio {
   /** Float32 interleaved PCM, already resampled to 16 kHz mono */
   samples: Float32Array;
+  /** Pre-computed Int16 LE PCM to avoid repeated conversion during streaming */
+  int16Samples?: Int16Array;
   /** Always 16000 */
   sampleRate: number;
   /** Duration in seconds */
@@ -29,20 +33,37 @@ export interface AudioChunk {
   duration: number;
 }
 
-const TARGET_SAMPLE_RATE = 16000;
-const CHUNK_DURATION_MS = 100;
+const TARGET_SAMPLE_RATE = AUDIO_CONFIG.sampleRate;
+const CHUNK_DURATION_MS = AUDIO_CONFIG.chunkDurationMs;
 const SAMPLES_PER_CHUNK = (TARGET_SAMPLE_RATE * CHUNK_DURATION_MS) / 1000; // 1600
+
+// In-memory cache of decoded audio buffers keyed by URL to prevent repeated network fetches and decoding
+const decodedAudioCache = new Map<string, Promise<DecodedAudio>>();
 
 /**
  * Fetch an audio file, decode it and resample to 16 kHz mono.
+ * Memoizes in-flight and completed decodes by URL.
  */
 export async function fetchAndDecodeAudio(url: string): Promise<DecodedAudio> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch audio: ${response.status} ${response.statusText}`);
+  const cached = decodedAudioCache.get(url);
+  if (cached) return cached;
+
+  const decodePromise = (async () => {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch audio: ${response.status} ${response.statusText}`);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    return decodeAudioBuffer(arrayBuffer);
+  })();
+
+  decodedAudioCache.set(url, decodePromise);
+  try {
+    return await decodePromise;
+  } catch (err) {
+    decodedAudioCache.delete(url);
+    throw err;
   }
-  const arrayBuffer = await response.arrayBuffer();
-  return decodeAudioBuffer(arrayBuffer);
 }
 
 /**
@@ -61,11 +82,14 @@ export async function decodeAudioBuffer(arrayBuffer: ArrayBuffer): Promise<Decod
     if (audioBuffer.sampleRate === TARGET_SAMPLE_RATE) {
       finalSamples = monoSamples;
     } else {
-      finalSamples = await resample(monoSamples, audioBuffer.sampleRate, TARGET_SAMPLE_RATE, audioContext);
+      finalSamples = await resample(monoSamples, audioBuffer.sampleRate, TARGET_SAMPLE_RATE);
     }
+
+    const int16Samples = float32ToInt16(finalSamples);
 
     return {
       samples: finalSamples,
+      int16Samples,
       sampleRate: TARGET_SAMPLE_RATE,
       duration: finalSamples.length / TARGET_SAMPLE_RATE,
     };
@@ -79,12 +103,17 @@ export async function decodeAudioBuffer(arrayBuffer: ArrayBuffer): Promise<Decod
  */
 function mixDownToMono(audioBuffer: AudioBuffer): Float32Array {
   const { numberOfChannels, length } = audioBuffer;
+  if (numberOfChannels === 1) {
+    return new Float32Array(audioBuffer.getChannelData(0));
+  }
+
   const mono = new Float32Array(length);
+  const scale = 1 / numberOfChannels;
 
   for (let ch = 0; ch < numberOfChannels; ch++) {
     const channelData = audioBuffer.getChannelData(ch);
     for (let i = 0; i < length; i++) {
-      mono[i] += channelData[i] / numberOfChannels;
+      mono[i] += channelData[i] * scale;
     }
   }
   return mono;
@@ -98,7 +127,6 @@ async function resample(
   samples: Float32Array,
   fromRate: number,
   toRate: number,
-  _ctx: AudioContext,
 ): Promise<Float32Array> {
   const sourceDuration = samples.length / fromRate;
   const targetLength = Math.ceil(sourceDuration * toRate);
@@ -154,16 +182,16 @@ export function int16ToBase64(int16: Int16Array): string {
  */
 export function buildChunks(decoded: DecodedAudio): AudioChunk[] {
   const { samples } = decoded;
+  const int16All = decoded.int16Samples ?? float32ToInt16(samples);
   const chunks: AudioChunk[] = [];
-  const totalSamples = samples.length;
+  const totalSamples = int16All.length;
   let offset = 0;
   let index = 0;
 
   while (offset < totalSamples) {
     const end = Math.min(offset + SAMPLES_PER_CHUNK, totalSamples);
-    const slice = samples.slice(offset, end);
-    const int16 = float32ToInt16(slice);
-    const data = int16ToBase64(int16);
+    const slice = int16All.subarray(offset, end);
+    const data = int16ToBase64(slice);
     const startTime = offset / TARGET_SAMPLE_RATE;
     const duration = slice.length / TARGET_SAMPLE_RATE;
 

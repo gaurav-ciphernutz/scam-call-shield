@@ -16,11 +16,28 @@ const VALID_CATEGORIES: FlagCategory[] = [
   'credential_request',
 ];
 
+const RISK_ORDER: Record<RiskLevel, number> = {
+  unknown: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+};
+
+function normalizeEvidenceKey(evidence: string): string {
+  return evidence
+    .replace(/^["'«“‘]+|["'»”’]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 /**
  * Parse and validate a raw JSON string from the Gemini model.
  * Returns a validated ScamAssessment or null if validation fails.
  */
 export function parseAssessment(raw: string): ScamAssessment | null {
+  if (!raw || typeof raw !== 'string') return null;
+
   // Extract JSON from the response (model may wrap it in markdown code blocks)
   const jsonMatch = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/) ||
                     raw.match(/(\{[\s\S]*\})/);
@@ -53,38 +70,45 @@ export function parseAssessment(raw: string): ScamAssessment | null {
  * Validate a parsed object against the ScamAssessment schema.
  */
 export function validateAssessment(obj: unknown): ScamAssessment | null {
-  if (!obj || typeof obj !== 'object') return null;
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
 
   const data = obj as Record<string, unknown>;
 
   // riskLevel
-  const riskLevel = data['riskLevel'] ?? data['risk_level'];
-  if (!VALID_RISK_LEVELS.includes(riskLevel as RiskLevel)) {
-    console.warn('[ScamAssessment] Invalid riskLevel:', riskLevel);
+  const rawRisk = data['riskLevel'] ?? data['risk_level'];
+  const normalizedRisk = typeof rawRisk === 'string' ? rawRisk.trim().toLowerCase() : '';
+  if (!VALID_RISK_LEVELS.includes(normalizedRisk as RiskLevel)) {
+    console.warn('[ScamAssessment] Invalid riskLevel:', rawRisk);
     return null;
   }
 
   // language
-  const language = data['language'] ?? 'unknown';
-  const safeLanguage: Language = VALID_LANGUAGES.includes(language as Language)
-    ? (language as Language)
+  const rawLang = data['language'] ?? 'unknown';
+  const normalizedLang = typeof rawLang === 'string' ? rawLang.trim().toLowerCase() : 'unknown';
+  const safeLanguage: Language = VALID_LANGUAGES.includes(normalizedLang as Language)
+    ? (normalizedLang as Language)
     : 'unknown';
 
-  // redFlags
+  // redFlags (deduplicated within single payload as well)
   const rawFlags = data['redFlags'] ?? data['red_flags'] ?? [];
+  const seenKeys = new Set<string>();
   const redFlags: RedFlag[] = Array.isArray(rawFlags)
     ? rawFlags.flatMap((flag: unknown) => {
         if (!flag || typeof flag !== 'object') return [];
         const f = flag as Record<string, unknown>;
-        const category = f['category'];
-        const evidence = typeof f['evidence'] === 'string' ? f['evidence'].slice(0, 500) : '';
-        const explanation = typeof f['explanation'] === 'string' ? f['explanation'].slice(0, 500) : '';
+        const rawCategory = typeof f['category'] === 'string' ? f['category'].trim().toLowerCase() : '';
+        const evidence = typeof f['evidence'] === 'string' ? f['evidence'].trim().slice(0, 500) : '';
+        const explanation = typeof f['explanation'] === 'string' ? f['explanation'].trim().slice(0, 500) : '';
 
-        if (!VALID_CATEGORIES.includes(category as FlagCategory)) return [];
+        if (!VALID_CATEGORIES.includes(rawCategory as FlagCategory)) return [];
         if (!evidence || !explanation) return [];
 
+        const key = normalizeEvidenceKey(evidence);
+        if (!key || seenKeys.has(key)) return [];
+        seenKeys.add(key);
+
         return [{
-          category: category as FlagCategory,
+          category: rawCategory as FlagCategory,
           evidence,
           explanation,
         }];
@@ -93,19 +117,20 @@ export function validateAssessment(obj: unknown): ScamAssessment | null {
 
   // warning
   const warning = typeof data['warning'] === 'string'
-    ? data['warning'].slice(0, 1000)
+    ? data['warning'].trim().slice(0, 1000)
     : '';
 
   // assessmentComplete
   const assessmentComplete = Boolean(data['assessmentComplete'] ?? data['assessment_complete'] ?? false);
 
   // transcript
-  const transcript = typeof data['transcript'] === 'string'
-    ? data['transcript'].slice(0, 5000)
-    : undefined;
+  const rawTranscript = typeof data['transcript'] === 'string'
+    ? data['transcript'].trim().slice(0, 5000)
+    : '';
+  const transcript = rawTranscript.length > 0 ? rawTranscript : undefined;
 
   return {
-    riskLevel: riskLevel as RiskLevel,
+    riskLevel: normalizedRisk as RiskLevel,
     language: safeLanguage,
     redFlags,
     warning,
@@ -125,26 +150,37 @@ export function mergeAssessments(
   if (!current) return update;
 
   // Risk level can only escalate
-  const riskOrder: Record<RiskLevel, number> = { unknown: 0, low: 1, medium: 2, high: 3 };
-  const currentRank = riskOrder[current.riskLevel];
-  const updateRank = riskOrder[update.riskLevel];
+  const currentRank = RISK_ORDER[current.riskLevel];
+  const updateRank = RISK_ORDER[update.riskLevel];
   const riskLevel: RiskLevel =
     updateRank >= currentRank
       ? update.riskLevel
       : current.riskLevel;
 
   // Warning text protection:
-  // Never overwrite a higher-risk warning with a lower-risk or empty one.
+  // Never overwrite a higher-risk warning with a lower-risk or generic low-risk message.
+  const isGenericLowWarning = /no strong scam signals/i.test(update.warning || '');
   let warning = current.warning;
-  if (updateRank >= currentRank) {
+  if (updateRank > currentRank) {
     warning = update.warning || current.warning;
-  } else if (!current.warning) {
+  } else if (updateRank === currentRank) {
+    if (update.warning && (!isGenericLowWarning || riskLevel === 'low')) {
+      warning = update.warning;
+    }
+  } else if (!current.warning && !isGenericLowWarning) {
     warning = update.warning;
   }
 
   // Deduplicate red flags by normalized evidence string
-  const existingEvidence = new Set(current.redFlags.map(f => f.evidence.trim()));
-  const newFlags = update.redFlags.filter(f => !existingEvidence.has(f.evidence.trim()));
+  const existingEvidence = new Set(current.redFlags.map(f => normalizeEvidenceKey(f.evidence)));
+  const newFlags: RedFlag[] = [];
+  for (const flag of update.redFlags) {
+    const key = normalizeEvidenceKey(flag.evidence);
+    if (key && !existingEvidence.has(key)) {
+      existingEvidence.add(key);
+      newFlags.push(flag);
+    }
+  }
 
   // Cumulative transcript handling
   let transcript = current.transcript;
@@ -155,7 +191,7 @@ export function mergeAssessments(
       transcript = update.transcript;
     } else if (current.transcript.includes(update.transcript)) {
       transcript = current.transcript;
-    } else {
+    } else if (update.transcript.length >= current.transcript.length) {
       transcript = `${current.transcript} ${update.transcript}`.trim();
     }
   }
@@ -163,7 +199,7 @@ export function mergeAssessments(
   return {
     riskLevel,
     language: update.language !== 'unknown' ? update.language : current.language,
-    redFlags: [...current.redFlags, ...newFlags],
+    redFlags: newFlags.length > 0 ? [...current.redFlags, ...newFlags] : current.redFlags,
     warning,
     assessmentComplete: update.assessmentComplete || current.assessmentComplete,
     transcript,

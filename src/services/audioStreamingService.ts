@@ -13,6 +13,7 @@ import {
   type DecodedAudio,
   type AudioChunk,
 } from '../utils/audioUtils';
+import { AUDIO_CONFIG } from '../utils/constants';
 import type { GeminiLiveService } from './geminiLiveService';
 
 export type StreamingState = 'idle' | 'loading' | 'streaming' | 'paused' | 'ended' | 'error';
@@ -23,11 +24,12 @@ export interface StreamingCallbacks {
   onError: (error: Error) => void;
 }
 
-const CHUNK_DURATION_MS = 100; // Must match audioUtils
+const CHUNK_DURATION_MS = AUDIO_CONFIG.chunkDurationMs;
 
 export class AudioStreamingService {
   private state: StreamingState = 'idle';
   private decoded: DecodedAudio | null = null;
+  private cachedInt16: Int16Array | null = null;
   private chunks: AudioChunk[] = [];
   private currentChunkIndex = 0;
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -36,7 +38,11 @@ export class AudioStreamingService {
   private callbacks: StreamingCallbacks | null = null;
   private gemini: GeminiLiveService | null = null;
   private currentUrl = '';
+  private loadPromise: Promise<void> | null = null;
+  private loadGeneration = 0;
   private audible: HTMLAudioElement | null = null;
+  private lastEncodedSampleCount = -1;
+  private lastEncodedBase64: string | null = null;
 
   /** Audible playback so the user hears the call; the streamed PCM is what Gemini receives. */
   private playAudible(fromSec: number): void {
@@ -47,32 +53,67 @@ export class AudioStreamingService {
       void this.audible.play()?.catch(() => {});
     } catch { /* playback is best-effort */ }
   }
+
   private stopAudible(reset = false): void {
-    try { this.audible?.pause(); if (reset && this.audible) this.audible.currentTime = 0; } catch { /* ignore */ }
+    try {
+      if (!this.audible) return;
+      this.audible.pause();
+      if (reset) this.audible.currentTime = 0;
+    } catch { /* ignore */ }
+  }
+
+  private releaseAudible(): void {
+    try {
+      if (!this.audible) return;
+      this.audible.pause();
+      this.audible.removeAttribute('src');
+      this.audible.load?.();
+    } catch { /* ignore */ }
+    this.audible = null;
   }
 
   /**
    * Load and decode an audio file for streaming.
+   * Deduplicates concurrent loads for the same URL and guards against stale completions.
    */
   async load(url: string): Promise<void> {
     if (url === this.currentUrl && this.decoded) return; // already loaded
+    if (url === this.currentUrl && this.loadPromise) return this.loadPromise; // load in progress
 
+    const gen = ++this.loadGeneration;
     this.stop();
     this.setState('loading');
     this.currentUrl = url;
-    this.audible = null;
+    this.decoded = null;
+    this.cachedInt16 = null;
+    this.chunks = [];
+    this.lastEncodedSampleCount = -1;
+    this.lastEncodedBase64 = null;
+    this.releaseAudible();
 
-    try {
-      const decoded = await fetchAndDecodeAudio(url);
-      this.decoded = decoded;
-      this.chunks = buildChunks(decoded);
-      this.setState('idle');
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      this.setState('error');
-      this.callbacks?.onError(error);
-      throw error;
-    }
+    const task = (async () => {
+      try {
+        const decoded = await fetchAndDecodeAudio(url);
+        if (gen !== this.loadGeneration) return;
+        this.decoded = decoded;
+        this.cachedInt16 = decoded.int16Samples ?? float32ToInt16(decoded.samples);
+        this.chunks = buildChunks(decoded);
+        this.setState('idle');
+      } catch (err) {
+        if (gen !== this.loadGeneration) return;
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.setState('error');
+        this.callbacks?.onError(error);
+        throw error;
+      } finally {
+        if (gen === this.loadGeneration) {
+          this.loadPromise = null;
+        }
+      }
+    })();
+
+    this.loadPromise = task;
+    return task;
   }
 
   /**
@@ -201,7 +242,20 @@ export class AudioStreamingService {
     if (!this.decoded) return null;
     const n = Math.min(this.decoded.samples.length, Math.floor(sec * this.decoded.sampleRate));
     if (n < this.decoded.sampleRate * 0.5) return null;
-    return int16ToBase64(float32ToInt16(this.decoded.samples.subarray(0, n)));
+
+    if (n === this.lastEncodedSampleCount && this.lastEncodedBase64 !== null) {
+      return this.lastEncodedBase64;
+    }
+
+    const int16Source =
+      this.cachedInt16 && this.cachedInt16.length >= n
+        ? this.cachedInt16.subarray(0, n)
+        : float32ToInt16(this.decoded.samples.subarray(0, n));
+
+    const encoded = int16ToBase64(int16Source);
+    this.lastEncodedSampleCount = n;
+    this.lastEncodedBase64 = encoded;
+    return encoded;
   }
 
   get currentState(): StreamingState {
@@ -228,11 +282,15 @@ export class AudioStreamingService {
    * Clean up all resources.
    */
   destroy(): void {
+    this.loadGeneration++;
+    this.loadPromise = null;
     this.clearTimeout();
-    this.stopAudible();
-    this.audible = null;
+    this.releaseAudible();
     this.decoded = null;
+    this.cachedInt16 = null;
     this.chunks = [];
+    this.lastEncodedSampleCount = -1;
+    this.lastEncodedBase64 = null;
     this.callbacks = null;
     this.gemini = null;
     this.state = 'idle';
