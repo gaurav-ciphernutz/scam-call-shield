@@ -47,10 +47,10 @@ export interface ScamShieldActions {
   restart: () => Promise<void>;
 }
 
-// Assessment interval: 2.2s pacing balances evidence accumulation with rapid mid-call detection.
-// Initial offset of 2.5s avoids evaluating initial greetings before scam signals appear.
-const MIN_ASSESS_INTERVAL_SEC = 2.2;
-const INITIAL_ASSESS_OFFSET_SEC = 2.5;
+// Assessment interval: 1.6s pacing ensures rapid turn-around with in-flight serialization.
+// Initial offset of 1.8s allows the opening identity claim to be captured in the first evaluation.
+const MIN_ASSESS_INTERVAL_SEC = 1.6;
+const INITIAL_ASSESS_OFFSET_SEC = 1.8;
 const REQUEST_TIMEOUT_MS = 9000;
 
 const INITIAL_STATE: ScamShieldState = {
@@ -253,49 +253,64 @@ export function useScamShield(): [ScamShieldState, ScamShieldActions] {
               `Audio stream reached end (${finalPos.toFixed(1)}s)`,
             );
 
-            // Execute final comprehensive assessment if not already completed
-            if (!assessmentRef.current?.assessmentComplete) {
+            const triggerFinal = () => {
+              if (runId !== runIdRef.current || assessmentRef.current?.assessmentComplete) return;
               const fullPcm = streaming.pcmBase64UpTo(finalPos);
-              if (fullPcm) {
-                // Abort any pending mid-call request to prioritize final assessment
-                activeAbortRef.current?.abort();
-                isAssessingRef.current = true;
-                const finalAbort = new AbortController();
-                activeAbortRef.current = finalAbort;
+              if (!fullPcm) return;
 
-                requestAssessment(fullPcm, true, finalAbort.signal)
-                  .then(finalResult => {
-                    if (runId !== runIdRef.current) return;
-                    timelineRef.current = recordTimelineEvent(
-                      timelineRef.current,
-                      'assessment_complete',
-                      finalPos,
-                      'Final Assessment Complete',
-                      `Final verdict: ${finalResult.riskLevel.toUpperCase()}`,
-                      finalResult.riskLevel,
-                    );
-                    const merged = mergeAssessments(assessmentRef.current, finalResult);
-                    assessmentRef.current = merged;
-                    setState(prev => ({
-                      ...prev,
-                      assessment: merged,
-                      transcript: finalResult.transcript ?? prev.transcript,
-                      timeline: { ...timelineRef.current },
-                      assessmentStatus: 'complete',
-                    }));
-                  })
-                  .catch(err => {
-                    if (runId === runIdRef.current && err.name !== 'AbortError') {
-                      console.warn('[useScamShield] Final assessment error:', err);
-                    }
-                  })
-                  .finally(() => {
-                    if (runId === runIdRef.current) {
-                      isAssessingRef.current = false;
-                      activeAbortRef.current = null;
-                    }
-                  });
-              }
+              isAssessingRef.current = true;
+              const finalAbort = new AbortController();
+              activeAbortRef.current = finalAbort;
+
+              requestAssessment(fullPcm, true, finalAbort.signal)
+                .then(finalResult => {
+                  if (runId !== runIdRef.current) return;
+                  timelineRef.current = recordTimelineEvent(
+                    timelineRef.current,
+                    'assessment_complete',
+                    finalPos,
+                    'Final Assessment Complete',
+                    `Final verdict: ${finalResult.riskLevel.toUpperCase()}`,
+                    finalResult.riskLevel,
+                  );
+                  const merged = mergeAssessments(assessmentRef.current, finalResult);
+                  assessmentRef.current = merged;
+                  setState(prev => ({
+                    ...prev,
+                    assessment: merged,
+                    transcript: finalResult.transcript ?? prev.transcript,
+                    timeline: { ...timelineRef.current },
+                    assessmentStatus: 'complete',
+                  }));
+                })
+                .catch(err => {
+                  if (runId === runIdRef.current && err.name !== 'AbortError') {
+                    console.warn('[useScamShield] Final assessment error:', err);
+                  }
+                })
+                .finally(() => {
+                  if (runId === runIdRef.current) {
+                    isAssessingRef.current = false;
+                    activeAbortRef.current = null;
+                  }
+                });
+            };
+
+            // If an assessment is currently in flight, do NOT abort it.
+            // Let it deliver its result, then trigger final wrap-up once it completes.
+            if (isAssessingRef.current) {
+              const checkPending = setInterval(() => {
+                if (runId !== runIdRef.current) {
+                  clearInterval(checkPending);
+                  return;
+                }
+                if (!isAssessingRef.current) {
+                  clearInterval(checkPending);
+                  triggerFinal();
+                }
+              }, 200);
+            } else {
+              triggerFinal();
             }
           }
 
