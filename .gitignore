@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.production
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.DS_Store
+.vscode/
+*.swp
+
+# Cache
+.cache/
+.turbo/
+
+# Test coverage
+coverage/
+
+# Temporary
+*.tmp
+*.temp
+*.tsbuildinfo
